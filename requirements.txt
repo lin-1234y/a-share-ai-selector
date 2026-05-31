@@ -1,0 +1,4 @@
+pandas>=2.2
+akshare>=1.16
+tushare>=1.4
+baostock>=0.9.1
