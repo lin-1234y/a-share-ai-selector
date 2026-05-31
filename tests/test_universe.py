@@ -12,7 +12,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from stock_selector.storage import StockDatabase
-from stock_selector.universe import market_data_status, update_universe_market
+from stock_selector.universe import UniverseMarketProgress, market_data_status, update_universe_market
 
 
 class UniverseTests(unittest.TestCase):
@@ -33,17 +33,38 @@ class UniverseTests(unittest.TestCase):
             )
             provider = _FakeUniverseProvider()
 
-            first = update_universe_market(db, provider, "20250101", "20250125")
-            second = update_universe_market(db, provider, "20250101", "20250125")
+            progress: list[UniverseMarketProgress] = []
+            first = update_universe_market(db, provider, "20250101", "20250125", batch_size=1, progress_callback=progress.append)
+            second = update_universe_market(db, provider, "20250101", "20250125", batch_size=1)
             status = market_data_status(db)
 
             self.assertEqual(first.symbol_count, 2)
+            self.assertEqual(first.completed_symbol_count, 2)
             self.assertEqual(first.quote_rows, 50)
-            self.assertEqual(second.quote_rows, 50)
+            self.assertEqual(second.skipped_symbol_count, 2)
+            self.assertEqual(second.quote_rows, 0)
             self.assertEqual(len(db.read_table("daily_quotes")), 50)
             self.assertEqual(status.universe_count, 2)
             self.assertEqual(status.quoted_symbol_count, 2)
             self.assertEqual(status.missing_symbol_count, 0)
+            self.assertFalse(progress[-1].running)
+
+    def test_update_universe_market_keeps_successful_batches_when_later_batch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = StockDatabase(Path(temp_dir) / "stock.db")
+            db.initialize()
+            db.upsert_dataframe(
+                "stocks",
+                pd.DataFrame([_stock("000001", "Alpha", "main"), _stock("300001", "Beta", "chinext")]),
+                keys=("symbol",),
+            )
+
+            result = update_universe_market(db, _FailingUniverseProvider(), "20250101", "20250125", batch_size=1)
+
+            self.assertEqual(result.completed_symbol_count, 1)
+            self.assertEqual(result.failed_symbol_count, 1)
+            self.assertEqual(len(db.read_table("daily_quotes")), 25)
+            self.assertTrue(result.errors)
 
 
 def _stock(symbol: str, name: str, board: str) -> dict[str, object]:
@@ -104,6 +125,13 @@ class _FakeUniverseProvider:
                 for symbol in symbols
             ]
         )
+
+
+class _FailingUniverseProvider(_FakeUniverseProvider):
+    def fetch_daily_quotes(self, symbols: list[str], start: str, end: str, adjust: str = "qfq") -> pd.DataFrame:
+        if symbols == ["300001"]:
+            raise RuntimeError("network failed")
+        return super().fetch_daily_quotes(symbols, start, end, adjust)
 
 
 if __name__ == "__main__":

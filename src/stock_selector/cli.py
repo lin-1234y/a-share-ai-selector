@@ -10,6 +10,7 @@ import pandas as pd
 from .config import DEFAULT_DB_PATH, DEFAULT_EXPORT_DIR, ScreenConfig
 from .dashboard import DashboardConfig, serve_dashboard
 from .providers import build_provider
+from .providers.baostock_provider import BaostockProvider
 from .queries import run_ask
 from .storage import StockDatabase
 from .strategy import screen_stocks
@@ -43,13 +44,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         count = update_market(db, provider, symbols, args.start, args.end, args.adjust)
         print(f"Updated {count} daily quote records.")
     elif args.command == "update-universe-market":
-        result = update_universe_market(db, provider, args.start, args.end, args.adjust)
+        result = update_universe_market(db, BaostockProvider(), args.start, args.end, args.adjust, batch_size=args.batch_size)
         if result.errors:
             print("; ".join(result.errors))
         print(
             "Updated "
-            f"{result.quote_rows} quote rows and {result.valuation_rows} valuation rows "
-            f"for {result.symbol_count} universe symbols. Latest trade date: {result.latest_trade_date}"
+            f"{result.quote_rows} quote rows for {result.symbol_count} universe symbols "
+            f"({result.completed_symbol_count} completed, {result.skipped_symbol_count} skipped, "
+            f"{result.failed_symbol_count} failed). Latest trade date: {result.latest_trade_date}"
         )
     elif args.command == "update-finance":
         symbols = _symbols_from_args(args.symbols) or db.active_symbols()
@@ -94,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     universe_market.add_argument("--start", required=True, help="Start date, e.g. 20250101")
     universe_market.add_argument("--end", required=True, help="End date, e.g. 20260531")
     universe_market.add_argument("--adjust", default="qfq", choices=["", "qfq", "hfq"], help="Adjustment mode for AKShare")
+    universe_market.add_argument("--batch-size", type=int, default=50, help="Number of symbols to update per batch")
 
     finance = subparsers.add_parser("update-finance", help="Update financial indicators")
     finance.add_argument("--symbols", default="", help="Comma-separated stock symbols; defaults to active universe")

@@ -18,11 +18,12 @@ from .ai import parse_natural_query, summarize_stock_insight
 from .config import DEFAULT_DB_PATH, DEFAULT_EXPORT_DIR, ScreenConfig
 from .fundamentals import fetch_stock_insight
 from .providers import build_provider
+from .providers.baostock_provider import BaostockProvider
 from .queries import evaluate_spec, parse_ask
 from .similarity import SimilarityRequest, similar_kline
 from .storage import StockDatabase
 from .strategy import screen_stocks
-from .universe import market_data_status, update_universe_market
+from .universe import UniverseMarketProgress, market_data_status, update_universe_market
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,24 @@ class DashboardConfig:
     host: str = "0.0.0.0"
     port: int = 8765
     open_browser: bool = False
+
+
+_UNIVERSE_UPDATE_LOCK = threading.RLock()
+_UNIVERSE_UPDATE_PROGRESS = UniverseMarketProgress(
+    running=False,
+    total_symbols=0,
+    completed_symbols=0,
+    skipped_symbols=0,
+    failed_symbols=0,
+    current_batch=0,
+    total_batches=0,
+    quote_rows=0,
+    latest_trade_date=None,
+    started_at=None,
+    updated_at=None,
+    finished_at=None,
+    errors=(),
+)
 
 
 def serve_dashboard(config: DashboardConfig) -> None:
@@ -121,10 +140,53 @@ def build_ask(db: StockDatabase, query: str, run_date: str, top: int) -> dict[st
     }
 
 
-def update_dashboard_universe_market(db: StockDatabase, start: str, end: str) -> dict[str, object]:
-    provider = build_provider(db=db)
-    result = update_universe_market(db, provider, start, end)
-    return _clean_record(result.__dict__)
+def start_dashboard_universe_market_update(db: StockDatabase, start: str, end: str, batch_size: int = 50) -> dict[str, object]:
+    with _UNIVERSE_UPDATE_LOCK:
+        if _UNIVERSE_UPDATE_PROGRESS.running:
+            return {"started": False, "message": "全市场行情更新正在运行。", "progress": _progress_dict()}
+
+    def run() -> None:
+        def callback(progress: UniverseMarketProgress) -> None:
+            global _UNIVERSE_UPDATE_PROGRESS
+            with _UNIVERSE_UPDATE_LOCK:
+                _UNIVERSE_UPDATE_PROGRESS = progress
+
+        try:
+            update_universe_market(
+                db,
+                BaostockProvider(),
+                start,
+                end,
+                "qfq",
+                batch_size=batch_size,
+                progress_callback=callback,
+            )
+        except Exception as exc:
+            with _UNIVERSE_UPDATE_LOCK:
+                current = _UNIVERSE_UPDATE_PROGRESS
+                globals()["_UNIVERSE_UPDATE_PROGRESS"] = UniverseMarketProgress(
+                    running=False,
+                    total_symbols=current.total_symbols,
+                    completed_symbols=current.completed_symbols,
+                    skipped_symbols=current.skipped_symbols,
+                    failed_symbols=current.failed_symbols,
+                    current_batch=current.current_batch,
+                    total_batches=current.total_batches,
+                    quote_rows=current.quote_rows,
+                    latest_trade_date=current.latest_trade_date,
+                    started_at=current.started_at,
+                    updated_at=datetime.now().isoformat(timespec="seconds"),
+                    finished_at=datetime.now().isoformat(timespec="seconds"),
+                    errors=tuple(list(current.errors) + [str(exc)]),
+                )
+
+    thread = threading.Thread(target=run, name="universe-market-update", daemon=True)
+    thread.start()
+    return {"started": True, "message": "全市场行情更新已启动。", "progress": _progress_dict()}
+
+
+def build_universe_update_status() -> dict[str, object]:
+    return _progress_dict()
 
 
 def build_similar_kline(db: StockDatabase, symbol: str, run_date: str, window: str, top: int) -> dict[str, object]:
@@ -284,7 +346,9 @@ def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPReques
                     query = parse_qs(parsed.query)
                     end = _date_param(query)
                     start = _str_param(query, "start", _history_start(end))
-                    self._send_json(update_dashboard_universe_market(db, start, end))
+                    self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 50)))
+                elif parsed.path == "/api/update-universe-market-status":
+                    self._send_json(build_universe_update_status())
                 elif parsed.path == "/api/ai/parse-query":
                     query = parse_qs(parsed.query)
                     self._send_json(build_ai_parse(_str_param(query, "query", "")))
@@ -387,6 +451,11 @@ def _int_param(query: dict[str, list[str]], key: str, default: int) -> int:
 def _bool_param(query: dict[str, list[str]], key: str, default: bool) -> bool:
     value = _str_param(query, key, str(default)).lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def _progress_dict() -> dict[str, object]:
+    with _UNIVERSE_UPDATE_LOCK:
+        return _clean_record(_UNIVERSE_UPDATE_PROGRESS.__dict__)
 
 
 def _period_return(closes: pd.Series, window: int) -> float | None:
@@ -684,11 +753,27 @@ async function runSimilar() {
 async function updateUniverseMarket() {
   const end = dateValue();
   const start = startYmd(end, 420);
-  qs("market-status").textContent = `正在更新沪深主板+创业板行情库，时间范围 ${start}-${end}，第一次可能比较久 ...`;
-  const data = await api(`/api/update-universe-market?start=${encodeURIComponent(start)}&date=${encodeURIComponent(end)}`);
-  const errors = data.errors?.length ? ` 部分失败：${data.errors[0]}` : "";
-  qs("market-status").textContent = `更新完成：${data.symbol_count}只股票，行情${data.quote_rows}行，估值${data.valuation_rows}行，最新交易日${data.latest_trade_date || "-"}。${errors}`;
-  await loadSummary();
+  qs("market-status").textContent = `正在启动沪深主板+创业板行情库更新，时间范围 ${start}-${end} ...`;
+  await api(`/api/update-universe-market?start=${encodeURIComponent(start)}&date=${encodeURIComponent(end)}&batch_size=50`);
+  pollUniverseMarket();
+}
+
+async function pollUniverseMarket() {
+  const data = await api("/api/update-universe-market-status");
+  const total = data.total_symbols || 0;
+  const done = (data.completed_symbols || 0) + (data.skipped_symbols || 0) + (data.failed_symbols || 0);
+  const pct = total ? `${Math.round(done / total * 100)}%` : "0%";
+  const errors = data.errors?.length ? ` 最近错误：${data.errors[data.errors.length - 1]}` : "";
+  qs("market-status").textContent =
+    `全市场行情更新${data.running ? "进行中" : "已停止"}：${done}/${total} (${pct})，` +
+    `批次 ${data.current_batch || 0}/${data.total_batches || 0}，` +
+    `新增/更新行情 ${data.quote_rows || 0} 行，失败 ${data.failed_symbols || 0} 只，` +
+    `最新交易日 ${data.latest_trade_date || "-"}。${errors}`;
+  if (data.running) {
+    setTimeout(() => pollUniverseMarket().catch(e => setStatus(e.message, "error")), 2500);
+  } else {
+    await loadSummary();
+  }
 }
 
 function startYmd(end, days) {
