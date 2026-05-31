@@ -87,9 +87,10 @@ def update_universe_market(
     end: str,
     adjust: str = "qfq",
     boards: Sequence[str] = DEFAULT_UNIVERSE_BOARDS,
-    batch_size: int = 50,
+    batch_size: int = 20,
     skip_current: bool = True,
     progress_callback: Callable[[UniverseMarketProgress], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> UniverseMarketUpdate:
     symbols = universe_symbols(db, boards=boards)
     if not symbols:
@@ -154,19 +155,27 @@ def update_universe_market(
         )
 
     emit(True, 0)
+    cancelled = False
     for index, batch in enumerate(batches, start=1):
-        try:
-            quotes = provider.fetch_daily_quotes(batch, start, end, adjust)
-        except Exception as exc:
-            failed_symbols += len(batch)
-            message = f"第{index}批失败({batch[0]}-{batch[-1]}): {exc}"
-            errors.append(message)
-            db.record_error(getattr(provider, "name", "provider"), "fetch_daily_quotes", exc)
+        for symbol in batch:
+            if should_cancel and should_cancel():
+                errors.append("用户已停止全市场行情更新。")
+                cancelled = True
+                break
+            try:
+                quotes = provider.fetch_daily_quotes([symbol], start, end, adjust)
+            except Exception as exc:
+                failed_symbols += 1
+                message = f"{symbol} 更新失败: {exc}"
+                errors.append(message)
+                db.record_error(getattr(provider, "name", "provider"), "fetch_daily_quotes", exc, symbol=symbol)
+                emit(True, index)
+                continue
+            quote_rows += db.upsert_dataframe("daily_quotes", quotes, keys=("symbol", "trade_date", "adjust"))
+            completed_symbols += 1
             emit(True, index)
-            continue
-        quote_rows += db.upsert_dataframe("daily_quotes", quotes, keys=("symbol", "trade_date", "adjust"))
-        completed_symbols += len(batch)
-        emit(True, index)
+        if cancelled:
+            break
 
     status = market_data_status(db, boards=boards)
     result = UniverseMarketUpdate(
@@ -179,7 +188,7 @@ def update_universe_market(
         latest_trade_date=status.latest_trade_date,
         errors=tuple(errors),
     )
-    emit(False, len(batches), finished_at=_now())
+    emit(False, index if batches else 0, finished_at=_now())
     return result
 
 

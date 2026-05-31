@@ -49,7 +49,30 @@ class UniverseTests(unittest.TestCase):
             self.assertEqual(status.missing_symbol_count, 0)
             self.assertFalse(progress[-1].running)
 
-    def test_update_universe_market_keeps_successful_batches_when_later_batch_fails(self) -> None:
+    def test_update_universe_market_keeps_successful_symbols_when_one_symbol_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = StockDatabase(Path(temp_dir) / "stock.db")
+            db.initialize()
+            db.upsert_dataframe(
+                "stocks",
+                pd.DataFrame(
+                    [
+                        _stock("000001", "Alpha", "main"),
+                        _stock("300001", "Beta", "chinext"),
+                        _stock("300002", "Gamma", "chinext"),
+                    ]
+                ),
+                keys=("symbol",),
+            )
+
+            result = update_universe_market(db, _FailingUniverseProvider(), "20250101", "20250125", batch_size=20)
+
+            self.assertEqual(result.completed_symbol_count, 2)
+            self.assertEqual(result.failed_symbol_count, 1)
+            self.assertEqual(len(db.read_table("daily_quotes")), 50)
+            self.assertTrue(any("300001" in error for error in result.errors))
+
+    def test_update_universe_market_can_be_cancelled_without_losing_written_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = StockDatabase(Path(temp_dir) / "stock.db")
             db.initialize()
@@ -58,13 +81,23 @@ class UniverseTests(unittest.TestCase):
                 pd.DataFrame([_stock("000001", "Alpha", "main"), _stock("300001", "Beta", "chinext")]),
                 keys=("symbol",),
             )
+            progress: list[UniverseMarketProgress] = []
 
-            result = update_universe_market(db, _FailingUniverseProvider(), "20250101", "20250125", batch_size=1)
+            result = update_universe_market(
+                db,
+                _FakeUniverseProvider(),
+                "20250101",
+                "20250125",
+                batch_size=20,
+                progress_callback=progress.append,
+                should_cancel=lambda: any(item.completed_symbols >= 1 for item in progress),
+            )
 
             self.assertEqual(result.completed_symbol_count, 1)
-            self.assertEqual(result.failed_symbol_count, 1)
+            self.assertEqual(result.failed_symbol_count, 0)
             self.assertEqual(len(db.read_table("daily_quotes")), 25)
-            self.assertTrue(result.errors)
+            self.assertFalse(progress[-1].running)
+            self.assertTrue(any("停止" in error for error in result.errors))
 
 
 def _stock(symbol: str, name: str, board: str) -> dict[str, object]:

@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     universe_market.add_argument("--start", required=True, help="Start date, e.g. 20250101")
     universe_market.add_argument("--end", required=True, help="End date, e.g. 20260531")
     universe_market.add_argument("--adjust", default="qfq", choices=["", "qfq", "hfq"], help="Adjustment mode for AKShare")
-    universe_market.add_argument("--batch-size", type=int, default=50, help="Number of symbols to update per batch")
+    universe_market.add_argument("--batch-size", type=int, default=20, help="Number of symbols to update per batch")
 
     finance = subparsers.add_parser("update-finance", help="Update financial indicators")
     finance.add_argument("--symbols", default="", help="Comma-separated stock symbols; defaults to active universe")

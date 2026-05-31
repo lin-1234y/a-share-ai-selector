@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+import socket
 from typing import Iterator, Sequence
 
 import pandas as pd
@@ -151,13 +152,18 @@ class BaostockProvider(DataProvider):
 
 @contextmanager
 def _baostock_session(bs: object) -> Iterator[None]:
-    login = bs.login()
-    if getattr(login, "error_code", "0") != "0":
-        raise RuntimeError(f"Baostock login failed: {login.error_msg}")
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(25)
     try:
-        yield
+        login = bs.login()
+        if getattr(login, "error_code", "0") != "0":
+            raise RuntimeError(f"Baostock login failed: {login.error_msg}")
+        try:
+            yield
+        finally:
+            bs.logout()
     finally:
-        bs.logout()
+        socket.setdefaulttimeout(previous_timeout)
 
 
 def _query_recent_frame(query_func) -> pd.DataFrame:

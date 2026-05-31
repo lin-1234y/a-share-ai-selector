@@ -51,6 +51,7 @@ _UNIVERSE_UPDATE_PROGRESS = UniverseMarketProgress(
     finished_at=None,
     errors=(),
 )
+_UNIVERSE_UPDATE_CANCEL = threading.Event()
 
 
 def serve_dashboard(config: DashboardConfig) -> None:
@@ -140,10 +141,11 @@ def build_ask(db: StockDatabase, query: str, run_date: str, top: int) -> dict[st
     }
 
 
-def start_dashboard_universe_market_update(db: StockDatabase, start: str, end: str, batch_size: int = 50) -> dict[str, object]:
+def start_dashboard_universe_market_update(db: StockDatabase, start: str, end: str, batch_size: int = 20) -> dict[str, object]:
     with _UNIVERSE_UPDATE_LOCK:
         if _UNIVERSE_UPDATE_PROGRESS.running:
             return {"started": False, "message": "全市场行情更新正在运行。", "progress": _progress_dict()}
+        _UNIVERSE_UPDATE_CANCEL.clear()
 
     def run() -> None:
         def callback(progress: UniverseMarketProgress) -> None:
@@ -160,6 +162,7 @@ def start_dashboard_universe_market_update(db: StockDatabase, start: str, end: s
                 "qfq",
                 batch_size=batch_size,
                 progress_callback=callback,
+                should_cancel=_UNIVERSE_UPDATE_CANCEL.is_set,
             )
         except Exception as exc:
             with _UNIVERSE_UPDATE_LOCK:
@@ -183,6 +186,14 @@ def start_dashboard_universe_market_update(db: StockDatabase, start: str, end: s
     thread = threading.Thread(target=run, name="universe-market-update", daemon=True)
     thread.start()
     return {"started": True, "message": "全市场行情更新已启动。", "progress": _progress_dict()}
+
+
+def cancel_dashboard_universe_market_update() -> dict[str, object]:
+    with _UNIVERSE_UPDATE_LOCK:
+        if not _UNIVERSE_UPDATE_PROGRESS.running:
+            return {"cancelled": False, "message": "当前没有正在运行的全市场行情更新。", "progress": _progress_dict()}
+        _UNIVERSE_UPDATE_CANCEL.set()
+        return {"cancelled": True, "message": "已请求停止更新，当前股票处理完后会停下。", "progress": _progress_dict()}
 
 
 def build_universe_update_status() -> dict[str, object]:
@@ -346,9 +357,11 @@ def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPReques
                     query = parse_qs(parsed.query)
                     end = _date_param(query)
                     start = _str_param(query, "start", _history_start(end))
-                    self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 50)))
+                    self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 20)))
                 elif parsed.path == "/api/update-universe-market-status":
                     self._send_json(build_universe_update_status())
+                elif parsed.path == "/api/cancel-universe-market":
+                    self._send_json(cancel_dashboard_universe_market_update())
                 elif parsed.path == "/api/ai/parse-query":
                     query = parse_qs(parsed.query)
                     self._send_json(build_ai_parse(_str_param(query, "query", "")))
@@ -562,6 +575,7 @@ INDEX_HTML = """<!doctype html>
           <h3>市场覆盖</h3>
           <div class="actions">
             <button id="update-universe">更新全市场行情</button>
+            <button id="cancel-universe">停止更新</button>
             <button id="refresh-summary">刷新</button>
           </div>
         </div>
@@ -627,7 +641,7 @@ INDEX_HTML = """<!doctype html>
 """
 
 
-APP_JS = r"""const state = { summary: null };
+APP_JS = r"""const state = { summary: null, lastUniverseDone: 0, lastUniverseUpdatedAt: null };
 
 const titles = {
   overview: ["总览", "数据库状态与最近交易数据"],
@@ -754,8 +768,16 @@ async function updateUniverseMarket() {
   const end = dateValue();
   const start = startYmd(end, 420);
   qs("market-status").textContent = `正在启动沪深主板+创业板行情库更新，时间范围 ${start}-${end} ...`;
-  await api(`/api/update-universe-market?start=${encodeURIComponent(start)}&date=${encodeURIComponent(end)}&batch_size=50`);
+  state.lastUniverseDone = 0;
+  state.lastUniverseUpdatedAt = null;
+  await api(`/api/update-universe-market?start=${encodeURIComponent(start)}&date=${encodeURIComponent(end)}&batch_size=20`);
   pollUniverseMarket();
+}
+
+async function cancelUniverseMarket() {
+  const data = await api("/api/cancel-universe-market");
+  qs("market-status").textContent = data.message || "已请求停止更新。";
+  await pollUniverseMarket();
 }
 
 async function pollUniverseMarket() {
@@ -764,11 +786,16 @@ async function pollUniverseMarket() {
   const done = (data.completed_symbols || 0) + (data.skipped_symbols || 0) + (data.failed_symbols || 0);
   const pct = total ? `${Math.round(done / total * 100)}%` : "0%";
   const errors = data.errors?.length ? ` 最近错误：${data.errors[data.errors.length - 1]}` : "";
+  const stuck = data.running && state.lastUniverseDone === done && state.lastUniverseUpdatedAt === data.updated_at && done > 0
+    ? " 如果这里几分钟都不变，说明数据源正在等待响应；系统会在单只股票失败后继续。"
+    : "";
+  state.lastUniverseDone = done;
+  state.lastUniverseUpdatedAt = data.updated_at;
   qs("market-status").textContent =
     `全市场行情更新${data.running ? "进行中" : "已停止"}：${done}/${total} (${pct})，` +
     `批次 ${data.current_batch || 0}/${data.total_batches || 0}，` +
     `新增/更新行情 ${data.quote_rows || 0} 行，失败 ${data.failed_symbols || 0} 只，` +
-    `最新交易日 ${data.latest_trade_date || "-"}。${errors}`;
+    `最新交易日 ${data.latest_trade_date || "-"}。${errors}${stuck}`;
   if (data.running) {
     setTimeout(() => pollUniverseMarket().catch(e => setStatus(e.message, "error")), 2500);
   } else {
@@ -910,6 +937,7 @@ function drawChart(rows) {
 document.querySelectorAll(".nav").forEach(btn => btn.addEventListener("click", () => switchView(btn.dataset.view)));
 qs("refresh-summary").addEventListener("click", () => loadSummary().catch(e => setStatus(e.message, "error")));
 qs("update-universe").addEventListener("click", () => updateUniverseMarket().catch(e => setStatus(e.message, "error")));
+qs("cancel-universe").addEventListener("click", () => cancelUniverseMarket().catch(e => setStatus(e.message, "error")));
 qs("run-screen").addEventListener("click", () => runScreen().catch(e => setStatus(e.message, "error")));
 qs("run-ask").addEventListener("click", () => runAsk().catch(e => setStatus(e.message, "error")));
 qs("parse-ai").addEventListener("click", () => parseAiQuery().catch(e => setStatus(e.message, "error")));
