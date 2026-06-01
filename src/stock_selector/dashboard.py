@@ -4,6 +4,7 @@ import json
 import mimetypes
 import socket
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -11,6 +12,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -18,12 +20,18 @@ from .ai import parse_natural_query, summarize_stock_insight
 from .config import DEFAULT_DB_PATH, DEFAULT_EXPORT_DIR, ScreenConfig
 from .fundamentals import fetch_stock_insight
 from .providers import build_provider
-from .providers.baostock_provider import BaostockProvider
 from .queries import evaluate_spec, parse_ask
 from .similarity import SimilarityRequest, similar_kline
 from .storage import StockDatabase
 from .strategy import screen_stocks
-from .universe import UniverseMarketProgress, market_data_status, update_universe_market
+from .universe import (
+    UniverseMarketProgress,
+    latest_market_job,
+    market_data_status,
+    market_quality_report,
+    recent_market_failures,
+    update_universe_market,
+)
 
 
 @dataclass(frozen=True)
@@ -59,6 +67,7 @@ def serve_dashboard(config: DashboardConfig) -> None:
     db.initialize()
     handler = _handler_factory(db, config.export_dir)
     server = ThreadingHTTPServer((config.host, config.port), handler)
+    _start_auto_market_update_thread(db)
     local_url = f"http://127.0.0.1:{server.server_port}"
     print(f"Dashboard running at {local_url}")
     for lan_url in _lan_urls(server.server_port):
@@ -75,25 +84,24 @@ def serve_dashboard(config: DashboardConfig) -> None:
 
 def build_summary(db: StockDatabase) -> dict[str, object]:
     stocks = db.read_table("stocks")
-    quotes = db.read_table("daily_quotes")
-    finance = db.read_table("financial_indicators")
-    valuations = db.read_table("valuations")
-    latest_date = _latest_value(quotes, "trade_date")
     universe_status = market_data_status(db)
     return {
         "stock_count": int(len(stocks)),
         "active_count": int(len(stocks[(stocks.get("is_st", 0) == 0)]) if not stocks.empty else 0),
-        "quote_count": int(len(quotes)),
+        "quote_count": int(db.query_value("SELECT COUNT(*) FROM daily_quotes") or 0),
         "universe_count": universe_status.universe_count,
         "quoted_universe_count": universe_status.quoted_symbol_count,
         "missing_universe_count": universe_status.missing_symbol_count,
-        "finance_count": int(len(finance)),
-        "valuation_count": int(len(valuations)),
-        "latest_trade_date": latest_date,
+        "finance_count": int(db.query_value("SELECT COUNT(*) FROM financial_indicators") or 0),
+        "valuation_count": int(db.query_value("SELECT COUNT(*) FROM valuations") or 0),
+        "latest_trade_date": db.query_value("SELECT MAX(trade_date) FROM daily_quotes"),
         "latest_universe_trade_date": universe_status.latest_trade_date,
-        "latest_report_date": _latest_value(finance, "report_date"),
-        "latest_valuation_date": _latest_value(valuations, "trade_date"),
+        "latest_report_date": db.query_value("SELECT MAX(report_date) FROM financial_indicators"),
+        "latest_valuation_date": db.query_value("SELECT MAX(trade_date) FROM valuations"),
         "board_counts": _value_counts(stocks, "board"),
+        "market_job": latest_market_job(db),
+        "auto_update_time": "中国时间 16:30",
+        "universe_name": "沪深主板 + 创业板 + 科创板",
     }
 
 
@@ -141,7 +149,7 @@ def build_ask(db: StockDatabase, query: str, run_date: str, top: int) -> dict[st
     }
 
 
-def start_dashboard_universe_market_update(db: StockDatabase, start: str, end: str, batch_size: int = 20) -> dict[str, object]:
+def start_dashboard_universe_market_update(db: StockDatabase, start: str, end: str, batch_size: int = 30) -> dict[str, object]:
     with _UNIVERSE_UPDATE_LOCK:
         if _UNIVERSE_UPDATE_PROGRESS.running:
             return {"started": False, "message": "全市场行情更新正在运行。", "progress": _progress_dict()}
@@ -156,11 +164,12 @@ def start_dashboard_universe_market_update(db: StockDatabase, start: str, end: s
         try:
             update_universe_market(
                 db,
-                BaostockProvider(),
+                build_provider(db=db),
                 start,
                 end,
                 "qfq",
                 batch_size=batch_size,
+                workers=6,
                 progress_callback=callback,
                 should_cancel=_UNIVERSE_UPDATE_CANCEL.is_set,
             )
@@ -198,6 +207,45 @@ def cancel_dashboard_universe_market_update() -> dict[str, object]:
 
 def build_universe_update_status() -> dict[str, object]:
     return _progress_dict()
+
+
+def build_market_failures(db: StockDatabase) -> dict[str, object]:
+    rows = recent_market_failures(db)
+    return {"rows": rows, "count": len(rows)}
+
+
+def build_market_quality(db: StockDatabase) -> dict[str, object]:
+    return market_quality_report(db)
+
+
+def _start_auto_market_update_thread(db: StockDatabase) -> None:
+    def run() -> None:
+        while True:
+            try:
+                now = datetime.now(ZoneInfo("Asia/Shanghai"))
+                if _should_auto_update(now, db):
+                    end = now.strftime("%Y%m%d")
+                    start = (now - timedelta(days=420)).strftime("%Y%m%d")
+                    start_dashboard_universe_market_update(db, start, end, batch_size=30)
+            except Exception as exc:
+                db.record_error("dashboard", "auto_market_update", exc)
+            time.sleep(60)
+
+    thread = threading.Thread(target=run, name="auto-market-update", daemon=True)
+    thread.start()
+
+
+def _should_auto_update(now: datetime, db: StockDatabase) -> bool:
+    if now.weekday() >= 5:
+        return False
+    if now.hour < 16 or (now.hour == 16 and now.minute < 30):
+        return False
+    latest_job = latest_market_job(db)
+    today = now.strftime("%Y%m%d")
+    if latest_job.get("end_date") == today and latest_job.get("status") in {"running", "finished"}:
+        return False
+    with _UNIVERSE_UPDATE_LOCK:
+        return not _UNIVERSE_UPDATE_PROGRESS.running
 
 
 def build_similar_kline(db: StockDatabase, symbol: str, run_date: str, window: str, top: int) -> dict[str, object]:
@@ -348,6 +396,22 @@ def export_stock_quotes(db: StockDatabase, symbol: str, export_dir: Path) -> dic
     return {"path": str(path), "row_count": int(len(quotes)), "symbol": resolved}
 
 
+def export_market_quotes(db: StockDatabase, export_dir: Path, trade_date: str | None = None) -> dict[str, object]:
+    date = trade_date or db.query_value("SELECT MAX(trade_date) FROM daily_quotes")
+    if not date:
+        return {"path": None, "row_count": 0, "message": "本地还没有行情数据。"}
+    quotes = db.read_table("daily_quotes", "trade_date = ?", (str(date),)).sort_values("symbol")
+    stocks = db.read_table("stocks")[["symbol", "name", "board"]] if not db.read_table("stocks").empty else pd.DataFrame()
+    if not stocks.empty and not quotes.empty:
+        quotes = quotes.merge(stocks, on="symbol", how="left")
+        preferred = ["symbol", "name", "board", "trade_date", "open", "high", "low", "close", "volume", "amount", "adjust", "source"]
+        quotes = quotes[[column for column in preferred if column in quotes.columns]]
+    export_dir.mkdir(parents=True, exist_ok=True)
+    path = export_dir / f"market_quotes_{date}.csv"
+    quotes.to_csv(path, index=False, encoding="utf-8-sig")
+    return {"path": str(path), "row_count": int(len(quotes)), "trade_date": str(date)}
+
+
 def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPRequestHandler]:
     class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -371,11 +435,22 @@ def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPReques
                     query = parse_qs(parsed.query)
                     end = _date_param(query)
                     start = _str_param(query, "start", _history_start(end))
-                    self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 20)))
+                    self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 30)))
                 elif parsed.path == "/api/update-universe-market-status":
                     self._send_json(build_universe_update_status())
                 elif parsed.path == "/api/cancel-universe-market":
                     self._send_json(cancel_dashboard_universe_market_update())
+                elif parsed.path == "/api/market/update/start":
+                    query = parse_qs(parsed.query)
+                    end = _date_param(query)
+                    start = _str_param(query, "start", _history_start(end))
+                    self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 30)))
+                elif parsed.path == "/api/market/update/status":
+                    self._send_json(build_universe_update_status())
+                elif parsed.path == "/api/market/update/failures":
+                    self._send_json(build_market_failures(db))
+                elif parsed.path == "/api/market/quality":
+                    self._send_json(build_market_quality(db))
                 elif parsed.path == "/api/ai/parse-query":
                     query = parse_qs(parsed.query)
                     self._send_json(build_ai_parse(_str_param(query, "query", "")))
@@ -409,6 +484,9 @@ def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPReques
                 elif parsed.path == "/api/export/stock-quotes":
                     query = parse_qs(parsed.query)
                     self._send_json(export_stock_quotes(db, _str_param(query, "symbol", ""), export_dir))
+                elif parsed.path == "/api/market/export":
+                    query = parse_qs(parsed.query)
+                    self._send_json(export_market_quotes(db, export_dir, _str_param(query, "date", "")))
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             except Exception as exc:
@@ -591,8 +669,10 @@ INDEX_HTML = """<!doctype html>
         <div class="panel-head">
           <h3>市场覆盖</h3>
           <div class="actions">
-            <button id="update-universe">更新全市场行情</button>
+            <button id="update-universe">一键更新行情</button>
             <button id="cancel-universe">停止更新</button>
+            <button id="show-market-issues">查看问题股票</button>
+            <button id="export-market-quotes">导出行情</button>
             <button id="refresh-summary">刷新</button>
           </div>
         </div>
@@ -728,7 +808,11 @@ async function loadSummary() {
   qs("board-counts").innerHTML = Object.keys(boards).length
     ? Object.entries(boards).map(([k, v]) => `<span>${k}<b>${v}</b></span>`).join("")
     : "<p class='empty'>还没有股票基础数据。</p>";
-  qs("market-status").textContent = `沪深主板+创业板行情覆盖 ${state.summary.quoted_universe_count || 0}/${state.summary.universe_count || 0}，缺少 ${state.summary.missing_universe_count || 0} 只。`;
+  const job = state.summary.market_job || {};
+  qs("market-status").textContent =
+    `${state.summary.universe_name || "沪深主板+创业板+科创板"}，行情覆盖 ${state.summary.quoted_universe_count || 0}/${state.summary.universe_count || 0}，` +
+    `缺少 ${state.summary.missing_universe_count || 0} 只。下次自动更新：${state.summary.auto_update_time || "中国时间 16:30"}。` +
+    `${job.status ? ` 最近更新：${job.status}，${job.message || ""}` : ""}`;
 }
 
 async function runScreen() {
@@ -785,10 +869,10 @@ async function runSimilar() {
 async function updateUniverseMarket() {
   const end = dateValue();
   const start = startYmd(end, 420);
-  qs("market-status").textContent = `正在启动沪深主板+创业板行情库更新，时间范围 ${start}-${end} ...`;
+  qs("market-status").textContent = `正在启动沪深主板+创业板+科创板行情库更新，时间范围 ${start}-${end} ...`;
   state.lastUniverseDone = 0;
   state.lastUniverseUpdatedAt = null;
-  await api(`/api/update-universe-market?start=${encodeURIComponent(start)}&date=${encodeURIComponent(end)}&batch_size=20`);
+  await api(`/api/market/update/start?start=${encodeURIComponent(start)}&date=${encodeURIComponent(end)}&batch_size=30`);
   pollUniverseMarket();
 }
 
@@ -799,7 +883,7 @@ async function cancelUniverseMarket() {
 }
 
 async function pollUniverseMarket() {
-  const data = await api("/api/update-universe-market-status");
+  const data = await api("/api/market/update/status");
   const total = data.total_symbols || 0;
   const done = (data.completed_symbols || 0) + (data.skipped_symbols || 0) + (data.failed_symbols || 0);
   const pct = total ? `${Math.round(done / total * 100)}%` : "0%";
@@ -813,12 +897,25 @@ async function pollUniverseMarket() {
     `全市场行情更新${data.running ? "进行中" : "已停止"}：${done}/${total} (${pct})，` +
     `批次 ${data.current_batch || 0}/${data.total_batches || 0}，` +
     `新增/更新行情 ${data.quote_rows || 0} 行，失败 ${data.failed_symbols || 0} 只，` +
-    `最新交易日 ${data.latest_trade_date || "-"}。${errors}${stuck}`;
+    `最新交易日 ${data.latest_trade_date || "-"}。来源：${sourceText(data.source_counts)}。${errors}${stuck}`;
   if (data.running) {
     setTimeout(() => pollUniverseMarket().catch(e => setStatus(e.message, "error")), 2500);
   } else {
     await loadSummary();
   }
+}
+
+async function showMarketIssues() {
+  const failures = await api("/api/market/update/failures");
+  const quality = await api("/api/market/quality");
+  const failureText = failures.count ? `失败股票 ${failures.count} 只，最近：${failures.rows.slice(0, 5).map(r => r.symbol).join("、")}` : "暂无失败股票";
+  const qualityText = quality.issue_count ? `质量问题 ${quality.issue_count} 条，最近：${quality.rows.slice(0, 5).map(r => `${r.symbol || "-"} ${r.message}`).join("；")}` : "暂无质量问题";
+  qs("market-status").textContent = `${failureText}。${qualityText}。`;
+}
+
+function sourceText(counts) {
+  if (!counts || !Object.keys(counts).length) return "-";
+  return Object.entries(counts).map(([name, count]) => `${name}${count}`).join("，");
 }
 
 function startYmd(end, days) {
@@ -956,6 +1053,13 @@ document.querySelectorAll(".nav").forEach(btn => btn.addEventListener("click", (
 qs("refresh-summary").addEventListener("click", () => loadSummary().catch(e => setStatus(e.message, "error")));
 qs("update-universe").addEventListener("click", () => updateUniverseMarket().catch(e => setStatus(e.message, "error")));
 qs("cancel-universe").addEventListener("click", () => cancelUniverseMarket().catch(e => setStatus(e.message, "error")));
+qs("show-market-issues").addEventListener("click", () => showMarketIssues().catch(e => setStatus(e.message, "error")));
+qs("export-market-quotes").addEventListener("click", async () => {
+  try {
+    const data = await api(`/api/market/export?date=${encodeURIComponent(state.summary?.latest_trade_date || "")}`);
+    setStatus(data.path ? `已导出 ${data.row_count} 行到 ${data.path}` : data.message);
+  } catch (e) { setStatus(e.message, "error"); }
+});
 qs("run-screen").addEventListener("click", () => runScreen().catch(e => setStatus(e.message, "error")));
 qs("run-ask").addEventListener("click", () => runAsk().catch(e => setStatus(e.message, "error")));
 qs("parse-ai").addEventListener("click", () => parseAiQuery().catch(e => setStatus(e.message, "error")));

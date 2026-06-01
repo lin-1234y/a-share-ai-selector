@@ -8,7 +8,8 @@ from ..storage import StockDatabase
 from .akshare_provider import AkShareProvider
 from .baostock_provider import BaostockProvider
 from .base import DataProvider
-from .tushare_provider import TushareProvider
+from .sina_provider import SinaProvider
+from .tencent_provider import TencentProvider
 
 
 class CompositeProvider(DataProvider):
@@ -57,13 +58,11 @@ class CompositeProvider(DataProvider):
                 return result
         if last_error is not None:
             raise last_error
-        raise RuntimeError(
-            "No data provider is available. Install akshare or set TUSHARE_TOKEN with tushare installed."
-        )
+        raise RuntimeError("No public data provider is available. Install akshare and baostock first.")
 
 
 def build_provider(db: StockDatabase | None = None) -> CompositeProvider:
-    providers: list[DataProvider] = [BaostockProvider(), TushareProvider(), AkShareProvider()]
+    providers: list[DataProvider] = [BaostockProvider(), AkShareProvider(), TencentProvider(), SinaProvider()]
     return CompositeProvider(providers, db=db)
 
 

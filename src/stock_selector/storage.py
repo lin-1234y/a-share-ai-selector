@@ -118,6 +118,50 @@ CREATE TABLE IF NOT EXISTS fetch_errors (
     error TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS market_update_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    universe_boards TEXT NOT NULL,
+    status TEXT NOT NULL,
+    total_symbols INTEGER NOT NULL DEFAULT 0,
+    completed_symbols INTEGER NOT NULL DEFAULT 0,
+    skipped_symbols INTEGER NOT NULL DEFAULT 0,
+    failed_symbols INTEGER NOT NULL DEFAULT 0,
+    quote_rows INTEGER NOT NULL DEFAULT 0,
+    latest_trade_date TEXT,
+    message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS market_update_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER,
+    symbol TEXT NOT NULL,
+    provider TEXT,
+    error TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_quality_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER,
+    symbol TEXT,
+    trade_date TEXT,
+    check_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trading_calendar (
+    trade_date TEXT PRIMARY KEY,
+    is_open INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -129,6 +173,8 @@ class StockDatabase:
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def initialize(self) -> None:
@@ -209,6 +255,27 @@ class StockDatabase:
         conn = self.connect()
         try:
             return pd.read_sql_query(sql, conn, params=params)
+        finally:
+            conn.close()
+
+    def execute(self, sql: str, params: Sequence[object] = ()) -> int:
+        self.initialize()
+        conn = self.connect()
+        try:
+            cursor = conn.execute(sql, params)
+            conn.commit()
+            return int(cursor.lastrowid or cursor.rowcount or 0)
+        finally:
+            conn.close()
+
+    def query_value(self, sql: str, params: Sequence[object] = ()) -> object:
+        self.initialize()
+        conn = self.connect()
+        try:
+            row = conn.execute(sql, params).fetchone()
+            if row is None:
+                return None
+            return row[0]
         finally:
             conn.close()
 
@@ -308,6 +375,46 @@ def table_columns(table: str) -> tuple[str, ...]:
             "avg_amount_20",
             "exclusion_reason",
             "created_at",
+        ),
+        "market_update_jobs": (
+            "id",
+            "started_at",
+            "finished_at",
+            "start_date",
+            "end_date",
+            "universe_boards",
+            "status",
+            "total_symbols",
+            "completed_symbols",
+            "skipped_symbols",
+            "failed_symbols",
+            "quote_rows",
+            "latest_trade_date",
+            "message",
+        ),
+        "market_update_failures": (
+            "id",
+            "job_id",
+            "symbol",
+            "provider",
+            "error",
+            "created_at",
+        ),
+        "market_quality_checks": (
+            "id",
+            "job_id",
+            "symbol",
+            "trade_date",
+            "check_name",
+            "status",
+            "message",
+            "created_at",
+        ),
+        "trading_calendar": (
+            "trade_date",
+            "is_open",
+            "source",
+            "updated_at",
         ),
     }
     return columns[table]

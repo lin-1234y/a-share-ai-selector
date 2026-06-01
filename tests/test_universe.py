@@ -38,16 +38,17 @@ class UniverseTests(unittest.TestCase):
             second = update_universe_market(db, provider, "20250101", "20250125", batch_size=1)
             status = market_data_status(db)
 
-            self.assertEqual(first.symbol_count, 2)
-            self.assertEqual(first.completed_symbol_count, 2)
-            self.assertEqual(first.quote_rows, 50)
-            self.assertEqual(second.skipped_symbol_count, 2)
+            self.assertEqual(first.symbol_count, 3)
+            self.assertEqual(first.completed_symbol_count, 3)
+            self.assertEqual(first.quote_rows, 75)
+            self.assertEqual(second.skipped_symbol_count, 3)
             self.assertEqual(second.quote_rows, 0)
-            self.assertEqual(len(db.read_table("daily_quotes")), 50)
-            self.assertEqual(status.universe_count, 2)
-            self.assertEqual(status.quoted_symbol_count, 2)
+            self.assertEqual(len(db.read_table("daily_quotes")), 75)
+            self.assertEqual(status.universe_count, 3)
+            self.assertEqual(status.quoted_symbol_count, 3)
             self.assertEqual(status.missing_symbol_count, 0)
             self.assertFalse(progress[-1].running)
+            self.assertIsNotNone(progress[-1].job_id)
 
     def test_update_universe_market_keeps_successful_symbols_when_one_symbol_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
