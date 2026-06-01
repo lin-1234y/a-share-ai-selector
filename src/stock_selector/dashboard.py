@@ -7,7 +7,7 @@ import threading
 import time
 import webbrowser
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -65,6 +65,7 @@ _UNIVERSE_UPDATE_CANCEL = threading.Event()
 def serve_dashboard(config: DashboardConfig) -> None:
     db = StockDatabase(config.db_path)
     db.initialize()
+    _close_stale_market_jobs(db)
     handler = _handler_factory(db, config.export_dir)
     server = ThreadingHTTPServer((config.host, config.port), handler)
     _start_auto_market_update_thread(db)
@@ -233,6 +234,19 @@ def _start_auto_market_update_thread(db: StockDatabase) -> None:
 
     thread = threading.Thread(target=run, name="auto-market-update", daemon=True)
     thread.start()
+
+
+def _close_stale_market_jobs(db: StockDatabase) -> None:
+    db.execute(
+        """
+        UPDATE market_update_jobs
+        SET status = 'cancelled',
+            finished_at = COALESCE(finished_at, ?),
+            message = '上次更新异常中断，已在本次启动时重置'
+        WHERE status = 'running'
+        """,
+        (datetime.now(UTC).isoformat(timespec="seconds"),),
+    )
 
 
 def _should_auto_update(now: datetime, db: StockDatabase) -> bool:
