@@ -9,5 +9,6 @@ data/*.db
 data/*.db-*
 exports/*.csv
 exports/*.log
+tools/*.msi
 *.log
 .env

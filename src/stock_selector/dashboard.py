@@ -334,6 +334,20 @@ def export_screen(db: StockDatabase, run_date: str, top: int, export_dir: Path) 
     return {"path": str(path), "row_count": int(len(rows))}
 
 
+def export_stock_quotes(db: StockDatabase, symbol: str, export_dir: Path) -> dict[str, object]:
+    resolved = _resolve_symbol(db, symbol)
+    if not resolved:
+        return {"path": None, "row_count": 0, "message": f"没有找到股票：{symbol}"}
+    stocks = db.read_table("stocks", "symbol = ?", (resolved,))
+    quotes = db.read_table("daily_quotes", "symbol = ?", (resolved,)).sort_values("trade_date")
+    if not stocks.empty:
+        quotes.insert(1, "name", str(stocks.iloc[0].get("name") or ""))
+    export_dir.mkdir(parents=True, exist_ok=True)
+    path = export_dir / f"stock_quotes_{resolved}.csv"
+    quotes.to_csv(path, index=False, encoding="utf-8-sig")
+    return {"path": str(path), "row_count": int(len(quotes)), "symbol": resolved}
+
+
 def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPRequestHandler]:
     class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -392,6 +406,9 @@ def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPReques
                 elif parsed.path == "/api/export/screen":
                     query = parse_qs(parsed.query)
                     self._send_json(export_screen(db, _date_param(query), _int_param(query, "top", 50), export_dir))
+                elif parsed.path == "/api/export/stock-quotes":
+                    query = parse_qs(parsed.query)
+                    self._send_json(export_stock_quotes(db, _str_param(query, "symbol", ""), export_dir))
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             except Exception as exc:
@@ -621,6 +638,7 @@ INDEX_HTML = """<!doctype html>
       <div class="toolbar">
         <input id="stock-symbol" value="300750" placeholder="例如 300750 / 300750.SZ / 宁德时代">
         <button id="run-stock">查看个股</button>
+        <button id="export-stock-quotes">导出行情CSV</button>
       </div>
       <p id="stock-status" class="hint">默认示例：300750 宁德时代。首次查询未缓存股票时会自动联网补数据，可能需要几秒到几十秒。</p>
       <div id="stock-profile" class="stock-grid"></div>
@@ -944,6 +962,13 @@ qs("parse-ai").addEventListener("click", () => parseAiQuery().catch(e => setStat
 qs("run-similar").addEventListener("click", () => runSimilar().catch(e => setStatus(e.message, "error")));
 qs("run-stock").addEventListener("click", () => runStock().catch(e => setStatus(e.message, "error")));
 qs("run-insight").addEventListener("click", () => runInsight().catch(e => setStatus(e.message, "error")));
+qs("export-stock-quotes").addEventListener("click", async () => {
+  try {
+    const symbol = qs("stock-symbol").value.trim();
+    const data = await api(`/api/export/stock-quotes?symbol=${encodeURIComponent(symbol)}`);
+    setStatus(data.path ? `已导出 ${data.row_count} 行到 ${data.path}` : data.message);
+  } catch (e) { setStatus(e.message, "error"); }
+});
 qs("stock-symbol").addEventListener("keydown", e => {
   if (e.key === "Enter") runStock().catch(err => setStatus(err.message, "error"));
 });
