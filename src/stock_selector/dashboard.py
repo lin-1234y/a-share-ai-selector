@@ -226,7 +226,7 @@ def _start_auto_market_update_thread(db: StockDatabase) -> None:
                 now = datetime.now(ZoneInfo("Asia/Shanghai"))
                 if _should_auto_update(now, db):
                     end = now.strftime("%Y%m%d")
-                    start = (now - timedelta(days=420)).strftime("%Y%m%d")
+                    start = _incremental_market_start(end)
                     start_dashboard_universe_market_update(db, start, end, batch_size=30)
             except Exception as exc:
                 db.record_error("dashboard", "auto_market_update", exc)
@@ -386,6 +386,14 @@ def _history_start(end: str) -> str:
     return (end_date - timedelta(days=365 * 3)).strftime("%Y%m%d")
 
 
+def _incremental_market_start(end: str) -> str:
+    try:
+        end_date = datetime.strptime(end, "%Y%m%d")
+    except ValueError:
+        end_date = datetime.now()
+    return (end_date - timedelta(days=10)).strftime("%Y%m%d")
+
+
 def export_screen(db: StockDatabase, run_date: str, top: int, export_dir: Path) -> dict[str, object]:
     output = screen_stocks(db, run_date, ScreenConfig())
     rows = output.included.head(top).copy()
@@ -448,7 +456,7 @@ def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPReques
                 elif parsed.path == "/api/update-universe-market":
                     query = parse_qs(parsed.query)
                     end = _date_param(query)
-                    start = _str_param(query, "start", _history_start(end))
+                    start = _str_param(query, "start", _incremental_market_start(end))
                     self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 30)))
                 elif parsed.path == "/api/update-universe-market-status":
                     self._send_json(build_universe_update_status())
@@ -457,7 +465,7 @@ def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPReques
                 elif parsed.path == "/api/market/update/start":
                     query = parse_qs(parsed.query)
                     end = _date_param(query)
-                    start = _str_param(query, "start", _history_start(end))
+                    start = _str_param(query, "start", _incremental_market_start(end))
                     self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 30)))
                 elif parsed.path == "/api/market/update/status":
                     self._send_json(build_universe_update_status())
@@ -882,8 +890,8 @@ async function runSimilar() {
 
 async function updateUniverseMarket() {
   const end = dateValue();
-  const start = startYmd(end, 420);
-  qs("market-status").textContent = `正在启动沪深主板+创业板+科创板行情库更新，时间范围 ${start}-${end} ...`;
+  const start = startYmd(end, 10);
+  qs("market-status").textContent = `正在补最近行情，时间范围 ${start}-${end}。每天收盘后只补最近几天，不再整年重抓。`;
   state.lastUniverseDone = 0;
   state.lastUniverseUpdatedAt = null;
   await api(`/api/market/update/start?start=${encodeURIComponent(start)}&date=${encodeURIComponent(end)}&batch_size=30`);
