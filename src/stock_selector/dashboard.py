@@ -19,6 +19,7 @@ import pandas as pd
 from .ai import parse_natural_query, summarize_stock_insight
 from .config import DEFAULT_DB_PATH, DEFAULT_EXPORT_DIR, ScreenConfig
 from .fundamentals import fetch_stock_insight
+from .market_snapshot import update_market_snapshot_quotes
 from .providers import build_provider
 from .queries import evaluate_spec, parse_ask
 from .similarity import SimilarityRequest, similar_kline
@@ -60,6 +61,7 @@ _UNIVERSE_UPDATE_PROGRESS = UniverseMarketProgress(
     errors=(),
 )
 _UNIVERSE_UPDATE_CANCEL = threading.Event()
+_FAST_MARKET_UPDATE_LOCK = threading.RLock()
 
 
 def serve_dashboard(config: DashboardConfig) -> None:
@@ -198,6 +200,80 @@ def start_dashboard_universe_market_update(db: StockDatabase, start: str, end: s
     return {"started": True, "message": "全市场行情更新已启动。", "progress": _progress_dict()}
 
 
+def start_dashboard_fast_market_update(db: StockDatabase, trade_date: str) -> dict[str, object]:
+    with _FAST_MARKET_UPDATE_LOCK:
+        with _UNIVERSE_UPDATE_LOCK:
+            if _UNIVERSE_UPDATE_PROGRESS.running:
+                return {"started": False, "message": "行情更新正在运行，请稍后。", "progress": _progress_dict()}
+
+        def run() -> None:
+            global _UNIVERSE_UPDATE_PROGRESS
+            started_at = datetime.now(UTC).isoformat(timespec="seconds")
+            with _UNIVERSE_UPDATE_LOCK:
+                _UNIVERSE_UPDATE_PROGRESS = UniverseMarketProgress(
+                    running=True,
+                    total_symbols=0,
+                    completed_symbols=0,
+                    skipped_symbols=0,
+                    failed_symbols=0,
+                    current_batch=1,
+                    total_batches=1,
+                    quote_rows=0,
+                    latest_trade_date=None,
+                    started_at=started_at,
+                    updated_at=started_at,
+                    finished_at=None,
+                    errors=(),
+                    job_id=None,
+                    source_counts={},
+                )
+            try:
+                result = update_market_snapshot_quotes(db, trade_date)
+                finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+                with _UNIVERSE_UPDATE_LOCK:
+                    _UNIVERSE_UPDATE_PROGRESS = UniverseMarketProgress(
+                        running=False,
+                        total_symbols=result.total_symbols,
+                        completed_symbols=result.matched_symbols,
+                        skipped_symbols=0,
+                        failed_symbols=max(result.total_symbols - result.matched_symbols, 0),
+                        current_batch=1,
+                        total_batches=1,
+                        quote_rows=result.quote_rows,
+                        latest_trade_date=result.trade_date,
+                        started_at=started_at,
+                        updated_at=finished_at,
+                        finished_at=finished_at,
+                        errors=(),
+                        job_id=None,
+                        source_counts={result.source: result.quote_rows},
+                    )
+            except Exception as exc:
+                finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+                with _UNIVERSE_UPDATE_LOCK:
+                    _UNIVERSE_UPDATE_PROGRESS = UniverseMarketProgress(
+                        running=False,
+                        total_symbols=0,
+                        completed_symbols=0,
+                        skipped_symbols=0,
+                        failed_symbols=1,
+                        current_batch=1,
+                        total_batches=1,
+                        quote_rows=0,
+                        latest_trade_date=None,
+                        started_at=started_at,
+                        updated_at=finished_at,
+                        finished_at=finished_at,
+                        errors=(str(exc),),
+                        job_id=None,
+                        source_counts={},
+                    )
+
+        thread = threading.Thread(target=run, name="fast-market-update", daemon=True)
+        thread.start()
+        return {"started": True, "message": "已启动快速行情更新。", "progress": _progress_dict()}
+
+
 def cancel_dashboard_universe_market_update() -> dict[str, object]:
     with _UNIVERSE_UPDATE_LOCK:
         if not _UNIVERSE_UPDATE_PROGRESS.running:
@@ -226,8 +302,7 @@ def _start_auto_market_update_thread(db: StockDatabase) -> None:
                 now = datetime.now(ZoneInfo("Asia/Shanghai"))
                 if _should_auto_update(now, db):
                     end = now.strftime("%Y%m%d")
-                    start = _incremental_market_start(end)
-                    start_dashboard_universe_market_update(db, start, end, batch_size=30)
+                    start_dashboard_fast_market_update(db, end)
             except Exception as exc:
                 db.record_error("dashboard", "auto_market_update", exc)
             time.sleep(60)
@@ -465,8 +540,12 @@ def _handler_factory(db: StockDatabase, export_dir: Path) -> type[BaseHTTPReques
                 elif parsed.path == "/api/market/update/start":
                     query = parse_qs(parsed.query)
                     end = _date_param(query)
-                    start = _str_param(query, "start", _incremental_market_start(end))
-                    self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 30)))
+                    mode = _str_param(query, "mode", "fast")
+                    if mode == "history":
+                        start = _str_param(query, "start", _incremental_market_start(end))
+                        self._send_json(start_dashboard_universe_market_update(db, start, end, _int_param(query, "batch_size", 30)))
+                    else:
+                        self._send_json(start_dashboard_fast_market_update(db, end))
                 elif parsed.path == "/api/market/update/status":
                     self._send_json(build_universe_update_status())
                 elif parsed.path == "/api/market/update/failures":
@@ -890,11 +969,10 @@ async function runSimilar() {
 
 async function updateUniverseMarket() {
   const end = dateValue();
-  const start = startYmd(end, 10);
-  qs("market-status").textContent = `正在补最近行情，时间范围 ${start}-${end}。每天收盘后只补最近几天，不再整年重抓。`;
+  qs("market-status").textContent = `正在快速更新 ${end} 的全市场收盘行情，优先一次性拉取当天快照。`;
   state.lastUniverseDone = 0;
   state.lastUniverseUpdatedAt = null;
-  await api(`/api/market/update/start?start=${encodeURIComponent(start)}&date=${encodeURIComponent(end)}&batch_size=30`);
+  await api(`/api/market/update/start?date=${encodeURIComponent(end)}&mode=fast`);
   pollUniverseMarket();
 }
 
