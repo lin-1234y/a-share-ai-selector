@@ -63,6 +63,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.command == "ask":
         path = run_ask(db, args.query, args.date, args.top, args.export_dir)
         print(f"Exported ask results to {path}")
+    elif args.command == "export-stock-quotes":
+        path = export_stock_quotes(db, args.symbol, args.export_dir)
+        print(f"Exported stock quotes to {path}")
     elif args.command == "update-all":
         end = args.end or datetime.now().strftime("%Y%m%d")
         start = args.start or (datetime.now() - timedelta(days=240)).strftime("%Y%m%d")
@@ -111,6 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--date", required=True, help="Query date, e.g. 20260531")
     ask.add_argument("--top", type=int, default=50, help="Number of results to export")
     ask.add_argument("--export-dir", type=Path, default=DEFAULT_EXPORT_DIR, help="CSV export directory")
+
+    export_stock = subparsers.add_parser("export-stock-quotes", help="Export one stock's local daily quotes to CSV")
+    export_stock.add_argument("--symbol", required=True, help="Stock symbol or name, e.g. 000792")
+    export_stock.add_argument("--export-dir", type=Path, default=DEFAULT_EXPORT_DIR, help="CSV export directory")
 
     all_cmd = subparsers.add_parser("update-all", help="Run basic, market, finance, and screen in sequence")
     all_cmd.add_argument("--start", default="", help="Start date; defaults to 240 calendar days before today")
@@ -173,6 +180,23 @@ def run_screen(db: StockDatabase, run_date: str, top: int, export_dir: Path) -> 
     return path
 
 
+def export_stock_quotes(db: StockDatabase, symbol: str, export_dir: Path) -> Path:
+    raw_symbol = symbol.strip()
+    normalized = _normalize_symbol(raw_symbol)
+    stocks = db.read_table("stocks", "symbol = ? OR ts_code = ? OR name = ?", (normalized, raw_symbol.upper(), raw_symbol))
+    if stocks.empty:
+        raise SystemExit(f"Stock not found: {raw_symbol}")
+    resolved = str(stocks.iloc[0]["symbol"])
+    quotes = db.read_table("daily_quotes", "symbol = ?", (resolved,)).sort_values("trade_date")
+    if quotes.empty:
+        raise SystemExit(f"No local quotes for: {resolved}")
+    quotes.insert(1, "name", str(stocks.iloc[0].get("name") or ""))
+    export_dir.mkdir(parents=True, exist_ok=True)
+    path = export_dir / f"stock_quotes_{resolved}.csv"
+    quotes.to_csv(path, index=False, encoding="utf-8-sig")
+    return path
+
+
 def _symbols_from_args(value: str | Sequence[str]) -> list[str]:
     if not value:
         return []
@@ -184,3 +208,13 @@ def _symbols_from_args(value: str | Sequence[str]) -> list[str]:
     for item in values:
         symbols.extend(part.strip() for part in str(item).split(",") if part.strip())
     return symbols
+
+
+def _normalize_symbol(value: str) -> str:
+    text = value.strip().upper()
+    if "." in text:
+        text = text.split(".", 1)[0]
+    if text.startswith(("SH", "SZ", "BJ")):
+        text = text[2:]
+    digits = "".join(char for char in text if char.isdigit())
+    return digits or text
